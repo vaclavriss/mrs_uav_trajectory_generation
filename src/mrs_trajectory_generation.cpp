@@ -24,6 +24,7 @@
 #include <eth_trajectory_generation/impl/polynomial_optimization_nonlinear_impl.h>
 #include <eth_trajectory_generation/trajectory.h>
 #include <eth_trajectory_generation/trajectory_sampling.h>
+#include <eth_trajectory_generation/Box3d.h>
 
 #include <mrs_lib/param_loader.h>
 #include <mrs_lib/geometry/cyclic.h>
@@ -226,6 +227,10 @@ private:
   double distFromSegment(const vec3_t& point, const vec3_t& seg1, const vec3_t& seg2);
 
   bool trajectorySrv(const mrs_msgs::TrajectoryReference& msg);
+
+bool pathIntersectsBox(std::optional<mrs_msgs::Path>& path_in, 
+                       const eth_trajectory_generation::Box3D& box, 
+                       const std::string& target_frame);
 
   // | --------------- dynamic reconfigure server --------------- |
 
@@ -1689,7 +1694,7 @@ std::optional<mrs_msgs::Path> MrsTrajectoryGeneration::transformPath(const mrs_m
   // if we transform to the current control frame, which is in fact the same frame as the tracker_cmd is in
   if (target_frame == path_in.header.frame_id) {
     return path_in;
-  }
+  } 
 
   // find the transformation
   auto tf = transformer_->getTransform(path_in.header.frame_id, target_frame, path_in.header.stamp);
@@ -1762,6 +1767,54 @@ double MrsTrajectoryGeneration::timeLeft(void) {
 
 //}
 
+/* pathIntersectsBox() //{ */
+
+bool MrsTrajectoryGeneration::pathIntersectsBox(std::optional<mrs_msgs::Path>& path_in, 
+                                                const eth_trajectory_generation::Box3D& box, 
+                                                const std::string& target_frame) {
+
+  if (!path_in){
+    ROS_WARN("[TrajectoryGeneration]: pathIntersectsBox() called with empty path, returning false");
+    return false;
+  }
+  else if (path_in->points.empty()){
+    ROS_WARN("[TrajectoryGeneration]: pathIntersectsBox() called with empty path, returning false");
+    return false;
+  }
+
+
+  std::optional<mrs_msgs::Path> transformed_path_opt;
+  const mrs_msgs::Path path_const = *path_in;  
+  
+  if (path_in->header.frame_id == target_frame) {
+    ROS_INFO("[TrajectoryGeneration]: pathIntersectsBox() called with the same source and target frame '%s'", target_frame.c_str());
+    transformed_path_opt = path_in;
+  }
+  else{
+    
+
+    auto transformed_path_opt = transformPath(path_const, target_frame);
+    
+    if (!transformed_path_opt) {
+      ROS_ERROR("[TrajectoryGeneration]: could not transform the path to the target frame '%s'", target_frame.c_str());
+      return false;
+    }  
+  }
+  
+  const auto& path = transformed_path_opt;
+
+  // 2. Test points against the box
+  for (const auto& ref : path->points) {
+    ROS_INFO("[TrajectoryGeneration]: Intersection testing - point (%.2f, %.2f, %.2f)", ref.position.x, ref.position.y, ref.position.z);
+    if (box.contains(ref.position.x, ref.position.y, ref.position.z)) {
+      return true; 
+    }
+  }
+  return false;
+}
+
+//}
+
 // | ------------------------ callbacks ----------------------- |
 
 /* callbackPath() //{ */
@@ -1771,7 +1824,6 @@ void MrsTrajectoryGeneration::callbackPath(const mrs_msgs::Path::ConstPtr msg) {
   if (!is_initialized_) {
     return;
   }
-
   /* preconditions //{ */
 
   if (!sh_constraints_.hasMsg()) {
@@ -2144,6 +2196,26 @@ bool MrsTrajectoryGeneration::callbackPathSrv(mrs_msgs::PathSrv::Request& req, m
       }
     }
   }
+
+  const std::array<Eigen::Vector3d, 4>& base = { Eigen::Vector3d(0,0,0),   
+                                               Eigen::Vector3d(10,0,0),  
+                                               Eigen::Vector3d(0,10,0),
+                                               Eigen::Vector3d(10,10,0) };  
+  
+                                               
+  eth_trajectory_generation::Box3D box(base, 10.0);
+  
+  std::string box_frame_id = "uav1/gps_baro_origin";
+
+  ROS_WARN("[MrsTrajectoryGeneration]: Frames: path '%s', box '%s', control '%s'", transformed_path->header.frame_id.c_str(), box_frame_id.c_str(), frame_id_.c_str());
+
+  if (MrsTrajectoryGeneration::pathIntersectsBox(transformed_path, box, frame_id_)) {
+    ROS_WARN("[MrsTrajectoryGeneration]: trajectory intersects a box");
+  }
+  else {
+    ROS_WARN("[MrsTrajectoryGeneration]: trajectory does not intersect any box");
+  }
+
 
   double total_time = (ros::Time::now() - start_time_total_).toSec();
 
