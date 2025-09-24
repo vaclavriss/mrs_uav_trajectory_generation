@@ -450,6 +450,7 @@ void MrsTrajectoryGeneration::onInit() {
   Drs_t::CallbackType f = boost::bind(&MrsTrajectoryGeneration::callbackDrs, this, _1, _2);
   drs_->setCallback(f);
 
+  /*
   const std::array<Eigen::Vector3d, 4>& base = { Eigen::Vector3d(0,0,0),   
                                                Eigen::Vector3d(10,0,0),  
                                                Eigen::Vector3d(10,10,0),
@@ -494,7 +495,7 @@ void MrsTrajectoryGeneration::onInit() {
 
     virtual_obstacles_.push_back(box_);
   }
-
+  */
   // | --------------------- finish the init -------------------- |
 
   ROS_INFO_ONCE("[TrajectoryGeneration]: initialized");
