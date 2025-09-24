@@ -9,6 +9,7 @@ mrs_uav_trajectory_generation:
   inequality_constraint_tolerance: 0.1
   max_iterations: 10
   derivative_to_optimize: 0
+  rate_virtual_obstacle_pub_timer: 1.0 # [Hz]
 
   scope_timer:
 

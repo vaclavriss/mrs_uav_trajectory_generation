@@ -20,6 +20,7 @@
 #include <mrs_msgs/Reference.h>
 #include <mrs_msgs/ControlManagerDiagnostics.h>
 #include <mrs_msgs/UavState.h>
+#include <mrs_msgs/ValidateReferenceArray.h>
 
 #include <eth_trajectory_generation/impl/polynomial_optimization_nonlinear_impl.h>
 #include <eth_trajectory_generation/trajectory.h>
@@ -40,6 +41,9 @@
 
 #include <dynamic_reconfigure/server.h>
 #include <mrs_uav_trajectory_generation/drsConfig.h>
+
+#include <visualization_msgs/Marker.h>
+#include <visualization_msgs/MarkerArray.h>
 
 #include <future>
 
@@ -116,6 +120,25 @@ private:
   double _path_straightener_max_hdg_deviation_;
 
   bool _override_heading_atan2_;
+
+  // | -------- obstacle parameters (come with the path) -------- |
+
+  double _rate_virtual_obstacle_pub_timer_ = 0.5;  // [Hz]
+
+  eth_trajectory_generation::Box3D box_;
+  std::mutex mutex_virtual_obstacles_;
+  std::vector<eth_trajectory_generation::Box3D> virtual_obstacles_;
+
+  ros::Timer timer_publish_virtual_obstacles_;
+  void       timerPublishVirtualObstacles([[maybe_unused]] const ros::TimerEvent& evt);
+
+  ros::Publisher pub_virtual_obstacles_;
+
+  const std::vector<std::pair<int, int>> edge_indices_ = {
+      {0, 1}, {1, 2}, {2, 3}, {3, 0},  // bottom face
+      {4, 5}, {5, 6}, {6, 7}, {7, 4},  // top face
+      {0, 4}, {1, 5}, {2, 6}, {3, 7}   // vertical edges
+  };
 
   // | -------- variable parameters (come with the path) -------- |
 
@@ -228,9 +251,15 @@ private:
 
   bool trajectorySrv(const mrs_msgs::TrajectoryReference& msg);
 
-bool pathIntersectsBox(std::optional<mrs_msgs::Path>& path_in, 
-                       const eth_trajectory_generation::Box3D& box, 
-                       const std::string& target_frame);
+  bool pathIntersectsBox(const mrs_msgs::TrajectoryReference& trajectory_in, const eth_trajectory_generation::Box3D& box);
+ 
+  std::optional<mrs_msgs::TrajectoryReference> transformTrajectory(const mrs_msgs::TrajectoryReference& trajectory, const std::string& target_frame);
+
+  bool callbackAddVirtualObstacle(mrs_msgs::ValidateReferenceArray::Request& req, mrs_msgs::ValidateReferenceArray::Response& res);
+  ros::ServiceServer service_server_add_virtual_obstacle_;
+
+  bool callbackRemoveVirtualObstacles(std_srvs::Trigger::Request& req, std_srvs::Trigger::Response& res);
+  ros::ServiceServer service_server_remove_virtual_obstacles_;
 
   // | --------------- dynamic reconfigure server --------------- |
 
@@ -295,7 +324,17 @@ void MrsTrajectoryGeneration::onInit() {
   service_server_get_path_ = nh_.advertiseService("get_path_in", &MrsTrajectoryGeneration::callbackGetPathSrv, this);
 
   service_client_trajectory_reference_ = nh_.serviceClient<mrs_msgs::TrajectoryReferenceSrv>("trajectory_reference_out");
+  
+  service_server_add_virtual_obstacle_ = nh_.advertiseService("add_virtual_obstacle_in", &MrsTrajectoryGeneration::callbackAddVirtualObstacle, this);
 
+  service_server_remove_virtual_obstacles_ = nh_.advertiseService("remove_virtual_obstacles_in", &MrsTrajectoryGeneration::callbackRemoveVirtualObstacles, this);
+
+  // | --------------------- Timer visualizations -------------------- |
+
+  pub_virtual_obstacles_ = nh_.advertise<visualization_msgs::MarkerArray>("virtual_obstacles_out", 1);
+
+  timer_publish_virtual_obstacles_ = nh_.createTimer(ros::Rate(_rate_virtual_obstacle_pub_timer_), &MrsTrajectoryGeneration::timerPublishVirtualObstacles, this);
+  
   // | ----------------------- parameters ----------------------- |
 
   mrs_lib::ParamLoader param_loader(nh_, "MrsTrajectoryGeneration");
@@ -351,6 +390,8 @@ void MrsTrajectoryGeneration::onInit() {
   param_loader.loadParam(yaml_prefix + "path_straightener/enabled", _path_straightener_enabled_);
   param_loader.loadParam(yaml_prefix + "path_straightener/max_deviation", _path_straightener_max_deviation_);
   param_loader.loadParam(yaml_prefix + "path_straightener/max_hdg_deviation", _path_straightener_max_hdg_deviation_);
+  
+  param_loader.loadParam(yaml_prefix + "rate_virtual_obstacle_pub_timer", _rate_virtual_obstacle_pub_timer_);
 
   param_loader.loadParam(yaml_prefix + "override_heading_atan2", _override_heading_atan2_);
 
@@ -408,6 +449,51 @@ void MrsTrajectoryGeneration::onInit() {
   drs_->updateConfig(params_);
   Drs_t::CallbackType f = boost::bind(&MrsTrajectoryGeneration::callbackDrs, this, _1, _2);
   drs_->setCallback(f);
+
+  const std::array<Eigen::Vector3d, 4>& base = { Eigen::Vector3d(0,0,0),   
+                                               Eigen::Vector3d(10,0,0),  
+                                               Eigen::Vector3d(10,10,0),
+                                               Eigen::Vector3d(0,10,0) };  
+  
+                                               
+  box_ = eth_trajectory_generation::Box3D(base, 10.0, "uav1/gps_baro_origin");
+
+  visualization_msgs::Marker edges;
+  auto&                      marker = box_.vis_marker;
+  marker.header.frame_id            = box_.frame_id;
+  marker.header.stamp               = ros::Time::now();
+  marker.ns                         = "edges";
+  marker.id                         = 0;
+  marker.type                       = visualization_msgs::Marker::LINE_LIST;
+  marker.action                     = visualization_msgs::Marker::ADD;
+  marker.scale.x                    = 0.04;  // line width
+
+  marker.color.r = 1.0;
+  marker.color.g = 0.0;
+  marker.color.b = 0.0;
+  marker.color.a = 1.0;
+
+  marker.points.reserve(edge_indices_.size());
+  
+  for (const auto& e : edge_indices_) {
+    geometry_msgs::Point p_start;
+    geometry_msgs::Point p_end;
+
+    p_start.x = box_.vertices[e.first].x();
+    p_start.y = box_.vertices[e.first].y();
+    p_start.z = box_.vertices[e.first].z();
+    p_end.x   = box_.vertices[e.second].x();
+    p_end.y   = box_.vertices[e.second].y();
+    p_end.z   = box_.vertices[e.second].z();
+    marker.points.push_back(p_start);
+    marker.points.push_back(p_end);
+  }
+
+  {
+    std::scoped_lock lock(mutex_virtual_obstacles_);
+
+    virtual_obstacles_.push_back(box_);
+  }
 
   // | --------------------- finish the init -------------------- |
 
@@ -1731,6 +1817,51 @@ std::optional<mrs_msgs::Path> MrsTrajectoryGeneration::transformPath(const mrs_m
 
 //}
 
+/* transformTrajectory() //{ */
+
+std::optional<mrs_msgs::TrajectoryReference> MrsTrajectoryGeneration::transformTrajectory(const mrs_msgs::TrajectoryReference& trajectory, const std::string& target_frame) {
+
+  // if we transform to the current control frame, which is in fact the same frame as the tracker_cmd is in
+  if (target_frame == trajectory.header.frame_id) {
+    return trajectory;
+  } 
+
+  // find the transformation
+  auto tf = transformer_->getTransform(trajectory.header.frame_id, target_frame, trajectory.header.stamp);
+
+  if (!tf) {
+    ROS_ERROR("[TrajectoryGeneration]: could not find transform from '%s' to '%s' in time %f", trajectory.header.frame_id.c_str(), target_frame.c_str(),
+              trajectory.header.stamp.toSec());
+    return {};
+  }
+
+  mrs_msgs::TrajectoryReference trajectory_out = trajectory;
+
+  trajectory_out.header.stamp    = tf.value().header.stamp;
+  trajectory_out.header.frame_id = transformer_->frame_to(tf.value());
+
+  for (size_t i = 0; i < trajectory.points.size(); i++) {
+
+    mrs_msgs::ReferenceStamped waypoint;
+
+    waypoint.header    = trajectory.header;
+    waypoint.reference = trajectory.points.at(i);
+
+    if (auto ret = transformer_->transform(waypoint, tf.value())) {
+
+      trajectory_out.points.at(i) = ret.value().reference;
+
+    } else {
+      return {};
+    }
+  }
+
+  return trajectory_out;
+}
+
+
+//}
+
 /* overtime() //{ */
 
 bool MrsTrajectoryGeneration::overtime(void) {
@@ -1767,55 +1898,200 @@ double MrsTrajectoryGeneration::timeLeft(void) {
 
 //}
 
+/* timerPublishVirtualObstacles() //{ */
+
+void MrsTrajectoryGeneration::timerPublishVirtualObstacles([[maybe_unused]] const ros::TimerEvent& evt) {
+
+  if (!is_initialized_) {
+    return;
+  }
+
+  if (pub_virtual_obstacles_.getNumSubscribers() == 0) {
+    return;
+  }
+
+  visualization_msgs::MarkerArray ma;
+  {
+    std::scoped_lock lock(mutex_virtual_obstacles_);
+
+    ma.markers.reserve(virtual_obstacles_.size());
+
+    for (int i = 0; i < virtual_obstacles_.size(); i++) {
+      auto& obst = virtual_obstacles_.at(i);
+
+      obst.vis_marker.header.stamp = evt.current_real;
+      obst.vis_marker.id           = i;
+      ma.markers.push_back(obst.vis_marker);
+    }
+  }
+
+  try {
+    pub_virtual_obstacles_.publish(ma);
+  }
+  catch (...) {
+    ROS_ERROR("exception caught during publishing topic '%s'", pub_virtual_obstacles_.getTopic().c_str());
+  }
+}
+
 /* pathIntersectsBox() //{ */
 
-bool MrsTrajectoryGeneration::pathIntersectsBox(std::optional<mrs_msgs::Path>& path_in, 
-                                                const eth_trajectory_generation::Box3D& box, 
-                                                const std::string& target_frame) {
+bool MrsTrajectoryGeneration::pathIntersectsBox(const mrs_msgs::TrajectoryReference& trajectory_in, 
+                                                const eth_trajectory_generation::Box3D& box) {
 
-  if (!path_in){
-    ROS_WARN("[TrajectoryGeneration]: pathIntersectsBox() called with empty path, returning false");
-    return false;
-  }
-  else if (path_in->points.empty()){
-    ROS_WARN("[TrajectoryGeneration]: pathIntersectsBox() called with empty path, returning false");
+  if (trajectory_in.points.empty()){
+    ROS_WARN("[TrajectoryGeneration]: pathIntersectsBox() called with empty trajectory.");
     return false;
   }
 
-
-  std::optional<mrs_msgs::Path> transformed_path_opt;
-  const mrs_msgs::Path path_const = *path_in;  
+  std::optional<mrs_msgs::TrajectoryReference> transformed_traj;
   
-  if (path_in->header.frame_id == target_frame) {
-    ROS_INFO("[TrajectoryGeneration]: pathIntersectsBox() called with the same source and target frame '%s'", target_frame.c_str());
-    transformed_path_opt = path_in;
+  if (trajectory_in.header.frame_id == box.frame_id) {
+    ROS_INFO("[TrajectoryGeneration]: pathIntersectsBox() called with the same source and target frame '%s'", box.frame_id.c_str());
+    transformed_traj = trajectory_in;
   }
   else{
     
-
-    auto transformed_path_opt = transformPath(path_const, target_frame);
+    transformed_traj = transformTrajectory(trajectory_in,  box.frame_id);
     
-    if (!transformed_path_opt) {
-      ROS_ERROR("[TrajectoryGeneration]: could not transform the path to the target frame '%s'", target_frame.c_str());
+    if (!transformed_traj) {
+      ROS_ERROR("[TrajectoryGeneration]: could not transform the trajectory to the target frame '%s'", box.frame_id.c_str());
       return false;
     }  
   }
   
-  const auto& path = transformed_path_opt;
+  ROS_INFO("[TrajectoryGeneration]: pathIntersectsBox() box vertices: (%.2f, %.2f, %.2f), (%.2f, %.2f, %.2f), (%.2f, %.2f, %.2f), (%.2f, %.2f, %.2f), height=%.2f", 
+            box.vertices[0].x(), box.vertices[0].y(), box.vertices[0].z(),
+            box.vertices[1].x(), box.vertices[1].y(), box.vertices[1].z(),
+            box.vertices[2].x(), box.vertices[2].y(), box.vertices[2].z(),
+            box.vertices[3].x(), box.vertices[3].y(), box.vertices[3].z(),
+            box.height);
 
-  // 2. Test points against the box
-  for (const auto& ref : path->points) {
-    ROS_INFO("[TrajectoryGeneration]: Intersection testing - point (%.2f, %.2f, %.2f)", ref.position.x, ref.position.y, ref.position.z);
-    if (box.contains(ref.position.x, ref.position.y, ref.position.z)) {
-      return true; 
+  if (transformed_traj->points.empty()){
+    ROS_ERROR("[TrajectoryGeneration]: pathIntersects() empty transformed trajectory, propably bug in transformTrajectory(), returning true.");
+    return false;
+  }
+  else{
+    for (const auto& ref : transformed_traj-> points) {
+        ROS_INFO("[TrajectoryGeneration]: Intersection testing - point (%.2f, %.2f, %.2f)", ref.position.x, ref.position.y, ref.position.z);
+        if (box.contains(ref.position.x, ref.position.y, ref.position.z)) {
+          return true; 
+        }
     }
   }
+  
   return false;
 }
 
 //}
 
 // | ------------------------ callbacks ----------------------- |
+
+//* callbackAddVirtualObstacle() { */
+
+bool MrsTrajectoryGeneration::callbackAddVirtualObstacle(mrs_msgs::ValidateReferenceArray::Request& req, mrs_msgs::ValidateReferenceArray::Response& res) {
+
+  if (!is_initialized_) {
+    res.success = {false};
+    res.message = "not yet initialized -> cannot insert virtual obstacle";
+    return true;
+  }
+
+  if (req.array.array.size() != 5) {
+    res.success = {false};
+    res.message = "array does not contain exactly 5 points -> cannot insert virtual obstacle";
+    return true;
+  }
+ 
+  auto& points = req.array.array;
+  Eigen::Vector3d ver_1 = Eigen::Vector3d(points.at(0).position.x, points.at(0).position.y, points.at(0).position.z);
+  Eigen::Vector3d ver_2 = Eigen::Vector3d(points.at(1).position.x, points.at(1).position.y, points.at(1).position.z);
+  Eigen::Vector3d ver_3 = Eigen::Vector3d(points.at(2).position.x, points.at(2).position.y, points.at(2).position.z);
+  Eigen::Vector3d ver_4 = Eigen::Vector3d(points.at(3).position.x, points.at(3).position.y, points.at(3).position.z);
+  double         height = points.at(4).position.z;
+
+  const std::array<Eigen::Vector3d, 4>& base = { ver_1, ver_2, ver_3, ver_4 };
+                   
+  eth_trajectory_generation::Box3D box(base, height, req.array.header.frame_id);
+
+  // | -------------------- Setup vis marker -------------------- |
+  visualization_msgs::Marker edges;
+  auto&                      marker = box.vis_marker;
+  marker.header.frame_id            = box.frame_id;
+  marker.header.stamp               = ros::Time::now();
+  marker.ns                         = "edges";
+  marker.id                         = 0;
+  marker.type                       = visualization_msgs::Marker::LINE_LIST;
+  marker.action                     = visualization_msgs::Marker::ADD;
+  marker.scale.x                    = 0.04;  // line width
+
+  marker.color.r = 1.0;
+  marker.color.g = 0.0;
+  marker.color.b = 0.0;
+  marker.color.a = 1.0;
+
+  marker.points.reserve(edge_indices_.size());
+  for (const auto& e : edge_indices_) {
+    geometry_msgs::Point p_start;
+    geometry_msgs::Point p_end;
+
+    p_start.x = box.vertices[e.first].x();
+    p_start.y = box.vertices[e.first].y();
+    p_start.z = box.vertices[e.first].z();
+    p_end.x   = box.vertices[e.second].x();
+    p_end.z   = box.vertices[e.second].z();
+    p_end.y   = box.vertices[e.second].y();
+    marker.points.push_back(p_start);
+    marker.points.push_back(p_end);
+  }
+
+  {
+    std::scoped_lock lock(mutex_virtual_obstacles_);
+
+    virtual_obstacles_.push_back(box);
+  }
+
+  ROS_INFO("[MrsOctomapPlanner] adding virtual obstacle Base: ");
+  ROS_INFO("                        vertice 1: x=%.1f y=%.1f ", ver_1.x(), ver_1.y());
+  ROS_INFO("                        vertice 2: x=%.1f y=%.1f ", ver_2.x(), ver_2.y());
+  ROS_INFO("                        vertice 3: x=%.1f y=%.1f ", ver_3.x(), ver_3.y());
+  ROS_INFO("                        vertice 4: x=%.1f y=%.1f ", ver_4.x(), ver_4.y());
+  ROS_INFO("                        min z= %.1f max z= %.1f ", ver_1.z(), ver_1.z() + height);
+  res.success = {true};
+  res.message = "obstacle added";
+
+  return true;
+}
+
+/* callbackRemoveVirtualObstacles() //{ */
+
+bool MrsTrajectoryGeneration::callbackRemoveVirtualObstacles(std_srvs::Trigger::Request& req, std_srvs::Trigger::Response& res) {
+
+  if (!is_initialized_) {
+    return false;
+  }
+
+  size_t virt_obst_size = virtual_obstacles_.size();
+
+  std::stringstream ss;
+
+  if (virt_obst_size > 0) {
+
+    std::scoped_lock lock(mutex_virtual_obstacles_);
+    virtual_obstacles_.clear();
+    ss << virt_obst_size << " obstacles removed from the virtual obstacles.";
+
+  } else {
+
+    ss << "Virtual obstacles array is empty. No obstacles to be removed.";
+  }
+
+  ROS_INFO_STREAM("[TrajectoryGeneration]: " << ss.str());
+  res.success = true;
+  res.message = ss.str();
+  return true;
+}
+
+//}
 
 /* callbackPath() //{ */
 
@@ -2197,26 +2473,16 @@ bool MrsTrajectoryGeneration::callbackPathSrv(mrs_msgs::PathSrv::Request& req, m
     }
   }
 
-  const std::array<Eigen::Vector3d, 4>& base = { Eigen::Vector3d(0,0,0),   
-                                               Eigen::Vector3d(10,0,0),  
-                                               Eigen::Vector3d(0,10,0),
-                                               Eigen::Vector3d(10,10,0) };  
-  
-                                               
-  eth_trajectory_generation::Box3D box(base, 10.0);
-  
-  std::string box_frame_id = "uav1/gps_baro_origin";
-
-  ROS_WARN("[MrsTrajectoryGeneration]: Frames: path '%s', box '%s', control '%s'", transformed_path->header.frame_id.c_str(), box_frame_id.c_str(), frame_id_.c_str());
-
-  if (MrsTrajectoryGeneration::pathIntersectsBox(transformed_path, box, frame_id_)) {
-    ROS_WARN("[MrsTrajectoryGeneration]: trajectory intersects a box");
+  for(const auto& box: virtual_obstacles_){
+    
+    if (MrsTrajectoryGeneration::pathIntersectsBox(trajectory, box)) {
+      ROS_ERROR("[TrajectoryGeneration]: trajectory intersects a virtual obstacle, cannot publish the trajectory");
+      success = false;
+      message = "trajectory intersects a virtual obstacle";
+      break;
+    }
   }
-  else {
-    ROS_WARN("[MrsTrajectoryGeneration]: trajectory does not intersect any box");
-  }
-
-
+  
   double total_time = (ros::Time::now() - start_time_total_).toSec();
 
   auto max_execution_time = mrs_lib::get_mutexed(mutex_max_execution_time_, max_execution_time_);

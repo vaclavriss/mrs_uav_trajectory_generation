@@ -22,6 +22,9 @@ mrs_uav_trajectory_generation:
     max_deviation: 0.05 # [m]
     max_hdg_deviation: 0.1 # [rad]
 
+  # Frequency of publishing the virtual obstacles for visualization
+  rate_virtual_obstacle_pub_timer: 1.0 # [Hz]
+
   # waypoints too close to each other cause issues in the optimization
   # the incoming path is preprocessed, such waypoints are neglected
   min_waypoint_distance: 0.05

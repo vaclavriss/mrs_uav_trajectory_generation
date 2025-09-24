@@ -61,6 +61,8 @@
 
         <!-- Service clients -->
       <remap from="~trajectory_reference_out" to="control_manager/trajectory_reference" />
+      <remap from="~add_virtual_obstacle_in" to="~add_virtual_obstacle" />
+      <remap from="~remove_virtual_obstacles_in" to="~remove_virtual_obstacles" />
 
     </node>
 

@@ -1,48 +1,90 @@
 #include <Eigen/Dense>
 #include <iostream>
 
+#include <visualization_msgs/Marker.h>
+#include <visualization_msgs/MarkerArray.h>
+
+
 namespace eth_trajectory_generation
 {
 
 class Box3D {
 
     public:
-    std::array<Eigen::Vector3d, 8> vertices; // 8 vrcholů boxu
 
-    // Konstruktor: podstava (4 body, všechny mají stejnou Z) + výška
-    Box3D(const std::array<Eigen::Vector3d, 4>& base, double height) {
-        // Podstava
-        for (int i = 0; i < 4; ++i) {
-            vertices[i] = base[i];
+        std::array<Eigen::Vector3d, 8> vertices;
+        std::string frame_id;
+        visualization_msgs::Marker   vis_marker;
+        double height;
+
+    Box3D() = default;
+
+    Box3D(const std::array<Eigen::Vector3d, 4>& base, double h, std::string box_frame_id) {
+        
+        this->height = h;
+
+        // find min z of the base and create bottom face at that z
+        double min_z = base[0].z();
+        for (int i = 1; i < 4; ++i) {
+            if (base[i].z() < min_z) {
+                min_z = base[i].z();
+            }
         }
-        // Horní podstava (posun Z o height)
+
+        // Vertices 0 - 3 are the base, 4 - 7 are the top
+        for (int i = 0; i < 4; ++i) {
+            Eigen::Vector3d v = base[i];
+            v.z() = min_z;
+            vertices[i] = v;
+        }
+        
+        // Create top vertices by adding height to z-coordinate
         for (int i = 0; i < 4; ++i) {
             Eigen::Vector3d top = base[i];
             top.z() += height;
             vertices[i + 4] = top;
         }
+        
+        frame_id = box_frame_id;
     }
 
-    // Test, zda bod leží uvnitř boxu (zjednodušeně: projekce do XY a test Z)
     bool contains(double x, double y, double z) const {
-        // Zjisti min/max Z
+
         double min_z = vertices[0].z();
         double max_z = vertices[4].z();
+        if (z < min_z || z > max_z) return false;
 
-        if (z < min_z || z > max_z)
-            return false;
-
-        // Projekce bodu do XY a test, zda leží uvnitř podstavy (polygon test)
         Eigen::Vector2d p(x, y);
-        int crossings = 0;
-        for (int i = 0; i < 4; ++i) {
+        
+        Eigen::Vector2d centroid(0.0, 0.0);
+
+        int n = 4; // number of vertices in the base       
+        
+        for (int i = 0; i < n; ++i)
+            centroid += Eigen::Vector2d(vertices[i].x(), vertices[i].y());
+        centroid /= double(n);
+
+        const double eps = 1e-9;
+        
+        for (int i = 0; i < n; ++i) {
             Eigen::Vector2d a(vertices[i].x(), vertices[i].y());
-            Eigen::Vector2d b(vertices[(i+1)%4].x(), vertices[(i+1)%4].y());
-            if (((a.y() > p.y()) != (b.y() > p.y())) &&
-                (p.x() < (b.x() - a.x()) * (p.y() - a.y()) / (b.y() - a.y()) + a.x()))
-                crossings++;
+            Eigen::Vector2d b(vertices[(i+1)%n].x(), vertices[(i+1)%n].y());
+            Eigen::Vector2d e = b - a;
+
+            Eigen::Vector2d nvec(e.y(), -e.x());
+
+            // Check if the normal vector points inward half-plane
+            double s_centroid = nvec.dot(centroid - a);
+            if (s_centroid > 0.0) {
+                nvec = -nvec;
+            }
+            // Test point
+            double d = nvec.dot(p - a);
+            if (d > eps)
+                return false;
         }
-        return (crossings % 2 == 1);
+
+        return true;
     }
 };
 }  // namespace eth_trajectory_generation
